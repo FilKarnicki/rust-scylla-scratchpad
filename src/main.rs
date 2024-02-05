@@ -7,6 +7,7 @@ use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use log::info;
 use serde_json::Value;
+use testcontainers::clients::Cli;
 use tokio_util::sync::CancellationToken;
 use std::sync::Arc;
 
@@ -235,44 +236,27 @@ async fn it_should_store_kafka_messages_in_scylladb() {
     let topic_out = "test-topic-out";
     let docker = clients::Cli::default();
     
-    let msg = WaitFor::Duration { length: std::time::Duration::from_secs(30) }; // YUCK! // TODO: the below doesn't work
-    //let msg = WaitFor::message_on_stdout("standard_role_manager - Created default superuser role 'cassandra'.");
+    let (_kafka_node, bootstrap_servers) = create_kafka_node(&docker, topic, topic_out);
+    let (_scylla_node, scylla_uri) = create_scylla_node(&docker);
+    
 
-    let kafka_node = docker.run(filkafka::Kafka::default());
-    let bootstrap_servers = format!(
-        "127.0.0.1:{}",
-        kafka_node.get_host_port_ipv4(crate::filkafka::KAFKA_PORT)
-    );
-    kafka_node.exec(ExecCommand { 
-        cmd: format!("kafka-topics --create --topic {topic} --bootstrap-server localhost:9092 && kafka-topics --create --topic {topic_out} --bootstrap-server localhost:9092"),
-        ready_conditions: vec![]});
-
-    let generic = GenericImage::new("scylladb/scylla", "latest")
-        .with_exposed_port(9042)
-        .with_wait_for(msg.clone());
-    let runnable_image: RunnableImage<GenericImage> = generic.into();
-    let scylla_node = docker.run(runnable_image);
-
-    let producer = ClientConfig::new()
+    let kafka_producer = ClientConfig::new()
         .set("bootstrap.servers", &bootstrap_servers)
         .set("message.timeout.ms", "5000")
         .create::<FutureProducer>()
         .expect("Failed to create Kafka FutureProducer");
-    
-    let scyla_port = scylla_node.get_host_port_ipv4(9042);
-    let scyla_uri = format!("localhost:{}", scyla_port);
 
-    let session = SessionBuilder::new()
-        .known_node(&scyla_uri)
+    let scylla_session = SessionBuilder::new()
+        .known_node(&scylla_uri)
         .build()
         .await
         .unwrap();
 
-    let _keyspace_query = session.query(
+    let _keyspace_query = scylla_session.query(
         "CREATE KEYSPACE store WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 1};", ())
             .await
             .unwrap();
-    let _table_query = session.query(
+    let _table_query = scylla_session.query(
         "CREATE TABLE store.users (
             id timeuuid PRIMARY KEY,
             email ascii,
@@ -283,9 +267,8 @@ async fn it_should_store_kafka_messages_in_scylladb() {
             .unwrap();
 
     let atomic_counter = Arc::new(AtomicI64::new(0));
-
-    let number_of_messages_to_produce: i64 = 5;
-    let mut expected: Vec<String> = (0..number_of_messages_to_produce)
+    let number_of_test_messages_to_produce: i64 = 5;
+    let mut test_messages_to_produce: Vec<String> = (0..number_of_test_messages_to_produce)
         .map(|i| format!(r#"
             {{
                 "id":{i},
@@ -295,7 +278,7 @@ async fn it_should_store_kafka_messages_in_scylladb() {
                 "ip_address":"127.0.0.1"
             }}"#))
         .collect();
-    expected.push(format!(r#"
+    test_messages_to_produce.push(format!(r#"
     {{
         "id":0,
         "first_name":"end",
@@ -304,8 +287,8 @@ async fn it_should_store_kafka_messages_in_scylladb() {
         "ip_address":""
     }}"#));
 
-    for (i, message) in expected.iter().enumerate() {
-        producer
+    for (i, message) in test_messages_to_produce.iter().enumerate() {
+        kafka_producer
             .send(
                 FutureRecord::to(topic)
                     .payload(message)
@@ -321,12 +304,14 @@ async fn it_should_store_kafka_messages_in_scylladb() {
     let _task_handler = tokio::spawn(async move {
         tokio::select! {
             _ = cloned_token.cancelled() => {
-                let query_result = session.query("SELECT COUNT(*) FROM store.users;", ()).await.unwrap();
+                let query_result = scylla_session.query("SELECT COUNT(*) FROM store.users;", ()).await.unwrap();
                 let row  = query_result.first_row().unwrap();
                 let typed = row.into_typed::<(i64,)>().unwrap();
-                assert_eq!(typed.0, number_of_messages_to_produce + 1);
+                assert_eq!(typed.0, number_of_test_messages_to_produce + 1);
                 use colored::Colorize;
                 println!("{}", "test passed successfully".green());
+                
+                // TODO: clean up docker containers/images
                 std::process::exit(0); 
             }
         }
@@ -337,127 +322,35 @@ async fn it_should_store_kafka_messages_in_scylladb() {
             bootstrap_servers, 
             "test_group_id", 
             topic, 
-            scyla_uri,
+            scylla_uri,
             atomic_counter,
             token)
     }).await;
-}
 
-mod filkafka {
-    use std::collections::HashMap;
-    use testcontainers::{
-        core::{ContainerState, ExecCommand, WaitFor},
-        Image, ImageArgs,
-    };
+    fn create_kafka_node<'a>(docker: &'a Cli, topic: &'a str, topic_out: &'a str) -> (Container<'a, rks::filkafka::Kafka>, String) {
+        let kafka_node = docker.run(rks::filkafka::Kafka::default());
+        let bootstrap_servers = format!(
+            "127.0.0.1:{}",
+            kafka_node.get_host_port_ipv4(rks::filkafka::KAFKA_PORT)
+        );
+        kafka_node.exec(ExecCommand { 
+            cmd: format!("kafka-topics --create --topic {topic} --bootstrap-server localhost:9092 && kafka-topics --create --topic {topic_out} --bootstrap-server localhost:9092"),
+            ready_conditions: vec![]});
 
-    const NAME: &str = "confluentinc/cp-kafka";
-    const TAG: &str = "7.3.2";
-
-    pub const KAFKA_PORT: u16 = 9093;
-    const ZOOKEEPER_PORT: u16 = 2181;
-
-    #[derive(Debug, Default, Clone)]
-    pub struct KafkaArgs;
-
-    impl ImageArgs for KafkaArgs {
-        fn into_iterator(self) -> Box<dyn Iterator<Item = String>> {
-            Box::new(
-                vec![
-                    "/bin/bash".to_owned(),
-                    "-c".to_owned(),
-                    format!(
-                        r#"
-    echo 'clientPort={ZOOKEEPER_PORT}' > zookeeper.properties;
-    echo 'dataDir=/var/lib/zookeeper/data' >> zookeeper.properties;
-    echo 'dataLogDir=/var/lib/zookeeper/log' >> zookeeper.properties;
-    zookeeper-server-start zookeeper.properties &
-    . /etc/confluent/docker/bash-config &&
-    /etc/confluent/docker/configure &&
-    /etc/confluent/docker/launch"#,
-                    ),
-                ]
-                .into_iter(),
-            )
-        }
+        (kafka_node, bootstrap_servers)
     }
 
-    #[derive(Debug)]
-    pub struct Kafka {
-        env_vars: HashMap<String, String>,
-    }
+    fn create_scylla_node<'a>(docker: &'a Cli) -> (Container<'a, GenericImage>, String) {
+        let msg = WaitFor::Duration { length: std::time::Duration::from_secs(30) }; // YUCK! // TODO: the below doesn't work
+        //let msg = WaitFor::message_on_stdout("standard_role_manager - Created default superuser role 'cassandra'.");
+        let scylla_image = GenericImage::new("scylladb/scylla", "latest")
+            .with_exposed_port(9042)
+            .with_wait_for(msg.clone());
+        let scylla_runnable_image: RunnableImage<GenericImage> = scylla_image.into();
+        let scylla_node = docker.run(scylla_runnable_image);
+        let scyla_port = scylla_node.get_host_port_ipv4(9042);
+        let scylla_uri = format!("localhost:{}", scyla_port);
 
-    impl Default for Kafka {
-        fn default() -> Self {
-            let mut env_vars = HashMap::new();
-
-            env_vars.insert(
-                "KAFKA_ZOOKEEPER_CONNECT".to_owned(),
-                format!("localhost:{ZOOKEEPER_PORT}"),
-            );
-            env_vars.insert(
-                "KAFKA_LISTENERS".to_owned(),
-                format!("PLAINTEXT://0.0.0.0:{KAFKA_PORT},BROKER://0.0.0.0:9092"),
-            );
-            env_vars.insert(
-                "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP".to_owned(),
-                "BROKER:PLAINTEXT,PLAINTEXT:PLAINTEXT".to_owned(),
-            );
-            env_vars.insert(
-                "KAFKA_INTER_BROKER_LISTENER_NAME".to_owned(),
-                "BROKER".to_owned(),
-            );
-            env_vars.insert(
-                "KAFKA_ADVERTISED_LISTENERS".to_owned(),
-                format!("PLAINTEXT://localhost:{KAFKA_PORT},BROKER://localhost:9092",),
-            );
-            env_vars.insert("KAFKA_BROKER_ID".to_owned(), "1".to_owned());
-            env_vars.insert(
-                "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR".to_owned(),
-                "1".to_owned(),
-            );
-
-            Self { env_vars }
-        }
-    }
-
-    impl Image for Kafka {
-        type Args = KafkaArgs;
-
-        fn name(&self) -> String {
-            NAME.to_owned()
-        }
-
-        fn tag(&self) -> String {
-            TAG.to_owned()
-        }
-
-        fn ready_conditions(&self) -> Vec<WaitFor> {
-            vec![WaitFor::message_on_stdout("Creating new log file")]
-        }
-
-        fn env_vars(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
-            Box::new(self.env_vars.iter())
-        }
-
-        fn expose_ports(&self) -> Vec<u16> {
-            vec![KAFKA_PORT]
-        }
-
-        fn exec_after_start(&self, cs: ContainerState) -> Vec<ExecCommand> {
-            let mut commands = vec![];
-            let cmd = format!(
-                "kafka-configs --alter --bootstrap-server 0.0.0.0:9092 --entity-type brokers --entity-name 1 --add-config advertised.listeners=[PLAINTEXT://127.0.0.1:{},BROKER://localhost:9092]",
-                cs.host_port_ipv4(KAFKA_PORT)
-            );
-            //let cmd = String::from("");
-            let ready_conditions = vec![WaitFor::message_on_stdout(
-                "Checking need to trigger auto leader balancing",
-            )];
-            commands.push(ExecCommand {
-                cmd,
-                ready_conditions,
-            });
-            commands
-        }
+        (scylla_node, scylla_uri)
     }
 }
